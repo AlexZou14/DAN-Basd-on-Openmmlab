@@ -18,11 +18,11 @@ How to run this repo: copy the file to the mmediting workspace and run the progr
 1. Copy files to MMEditing workspace.
 ```shell
 cd DAN-Basd-on-Openmmlab/
-mv ./mmedit/models/restorers/dan.py ../${mmediting_workspace}/mmedit/models/restorers/
-mv ./mmedit/models/backbones/sr_backbones/dan_net.py ../${mmediting_workspace}/mmedit/models/backbones/sr_backbones/
-mv ./mmedit/models/common/DANpreprocess.py ../${mmediting_workspace}/mmedit/models/common
-mv ./configs/restorers/dan ../${mmediting_workspace}/configs/restorers/
-mv ./tools/data/super-resolution/dan_datasets ../${mmediting_workspace}/tools/data/super-resolution/
+mv ./mmedit/models/restorers/dan.py ${mmediting_workspace}/mmedit/models/restorers/
+mv ./mmedit/models/backbones/sr_backbones/dan_net.py ${mmediting_workspace}/mmedit/models/backbones/sr_backbones/
+mv ./mmedit/models/common/DANpreprocess.py ${mmediting_workspace}/mmedit/models/common
+mv ./configs/restorers/dan ${mmediting_workspace}/configs/restorers/
+mv ./tools/data/super-resolution/dan_datasets ${mmediting_workspace}/tools/data/super-resolution/
 ```
 2. Modify the configuration file as follows:
 
