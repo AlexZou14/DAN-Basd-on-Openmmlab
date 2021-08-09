@@ -63,7 +63,7 @@ python tools/test.py configs/restorers/dan/dan_setting2.py ${CHECKPOINT_FILE} [-
 ### DIV2KRK
 The passwds of download links are all 'ta2o'
 
-| Method | scale | Datasets | Datasets | Download |
+| Method | scale | Datasets | PSNR | Download |
 | :-----: | :----: | :----: | :----: | :----:| 
 | DAN | x4 | DIV2KRK | 27.41 | [model](https://pan.baidu.com/s/1T_BOVR7Ui-NLUIKr6R20-w) / [test_pkl](https://pan.baidu.com/s/1T_BOVR7Ui-NLUIKr6R20-w) |
 
