@@ -34,8 +34,25 @@ gt_folder='${dataset_workspace}/dataset/DF2K_train_HR_sub' # your train data pat
 lq_folder='${dataset_workspace}/dataset/DIV2KRK/lr_x4' # your test data LR path
 gt_folder='${dataset_workspace}/dataset/DIV2KRK/gt' # your test data HR path
 ```
+3. Add script to init file, as follows:
 
-3. Training/Test
+- modify the `mmedit/models/backbones/sr_backbones/__init__.py`:
+```python
+from .dan_net import DAN
+# add DAN into __all__ list.
+```
+- modify the `mmedit/models/commons/__init__.py`:
+```python
+from .dan_preprocess import SRMDPreprocessing
+# add SRMDreprocessing into __all__ list.
+```
+- modify the `mmedit/models/restorers/__init__.py`:
+```python
+from .dan import DAN
+# add DAN into __all__ list.
+```
+
+4. Training/Test
 
 Before using it, please download and process the dataset and set the path in the configuration file.
 
