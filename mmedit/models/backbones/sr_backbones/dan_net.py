@@ -1,532 +1,209 @@
-import math
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.io import loadmat
-from torch.autograd import Variable
-from torchvision.utils import make_grid
+
+from mmcv.runner import load_checkpoint
+from mmedit.models.registry import BACKBONES
+from mmedit.utils import get_root_logger
 
 
-def img2tensor(img):
-    """
-    # BGR to RGB, HWC to CHW, numpy to tensor
-    Input: img(H, W, C), [0,255], np.uint8 (default)
-    Output: 3D(C,H,W), RGB order, float tensor
-    """
-    img = img.astype(np.float32) / 255.0
-    img = img[:, :, [2, 1, 0]]
-    img = torch.from_numpy(
-        np.ascontiguousarray(np.transpose(img,(2, 0,1)))
-    ).float()
-    return img
+class CALayer(nn.Module):
+    def __init__(self, nf, reduction=16):
+        super(CALayer, self).__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(nf, nf // reduction, 1, 1, 0),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(nf // reduction, nf, 1, 1, 0),
+            nn.Sigmoid(),
+        )
+        self.avg = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        y = self.avg(x)
+        y = self.body(y)
+        return torch.mul(x, y)
 
 
-def tensor2img(tensor, out_type=np.uint8, min_max=(0, 1)):
-    """
-    Converts a torch Tensor into an image Numpy array
-    Input: 4D(B,(3/1),H,W), 3D(C,H,W), or 2D(H,W), any range, RGB channel order
-    Output: 3D(H,W,C) or 2D(H,W), [0,255], np.uint8 (default)
-    """
-    tensor = tensor.squeeze().float().cpu().clamp_(*min_max)  # clamp
-    tensor = (tensor - min_max[0]) / (min_max[1] - min_max[0]
-                                      )  # to range [0,1]
-    n_dim = tensor.dim()
-    if n_dim == 4:
-        n_img = len(tensor)
-        img_np = make_grid(
-            tensor, nrow=int(math.sqrt(n_img)), normalize=False).numpy()
-        img_np = np.transpose(img_np[[2, 1, 0], :, :], (1, 2, 0))  # HWC, BGR
-    elif n_dim == 3:
-        img_np = tensor.numpy()
-        img_np = np.transpose(img_np[[2, 1, 0], :, :], (1, 2, 0))  # HWC, BGR
-    elif n_dim == 2:
-        img_np = tensor.numpy()
-    else:
-        raise TypeError('Only support 4D, 3D and 2D tensor.')
-    if out_type == np.uint8:
-        img_np = (img_np * 255.0).round()
-        # Important. Unlike matlab, numpy.unit8() WILL NOT round by default.
-    return img_np.astype(out_type)
+class CRB_Layer(nn.Module):
+    def __init__(self, nf1, nf2):
+        super(CRB_Layer, self).__init__()
+
+        body = [
+            nn.Conv2d(nf1 + nf2, nf1 + nf2, 3, 1, 1),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(nf1 + nf2, nf1, 3, 1, 1),
+            CALayer(nf1),
+        ]
+
+        self.body = nn.Sequential(*body)
+
+    def forward(self, x):
+        f1, f2 = x
+        f1 = self.body(torch.cat(x, 1)) + f1
+        return [f1, f2]
 
 
-def cubic(x):
-    absx = torch.abs(x)
-    absx2 = absx**2
-    absx3 = absx**3
+class Estimator(nn.Module):
+    def __init__(self, in_nc=3, nf=64, num_blocks=5, scale=4, kernel_size=4):
+        super(Estimator, self).__init__()
 
-    weight = (1.5 * absx3 - 2.5 * absx2 + 1) * (
-        (absx <= 1).type_as(absx)) + (-0.5 * absx3 + 2.5 * absx2 - 4 * absx +
-                                      2) * (((absx > 1) *
-                                             (absx <= 2)).type_as(absx))
-    return weight
+        self.ksize = kernel_size
 
+        self.head_LR = nn.Conv2d(in_nc, nf // 2, 1, 1, 0)
+        self.head_HR = nn.Conv2d(in_nc, nf // 2, 9, scale, 4)
 
-def calculate_weights_indices(in_length, out_length, scale, kernel,
-                              kernel_width, antialiasing):
-    if (scale < 1) and (antialiasing):
-        # Use a modified kernel to simultaneously interpolate
-        kernel_width = kernel_width / scale
+        body = [CRB_Layer(nf // 2, nf // 2) for _ in range(num_blocks)]
+        self.body = nn.Sequential(*body)
 
-    # Output-space coordinates
-    x = torch.linspace(1, out_length, out_length)
+        self.out = nn.Conv2d(nf // 2, 10, 3, 1, 1)
+        self.globalPooling = nn.AdaptiveAvgPool2d((1, 1))
 
-    # Input-space coordinates. Calculate the inverse mapping such that 0.5
-    # in output space maps to 0.5 in input space, and 0.5+scale in output
-    # space maps to 1.5 in input space.
-    u = x / scale + 0.5 * (1 - 1 / scale)
+    def forward(self, GT, LR):
 
-    # What is the left-most pixel that can be involved in the computation?
-    left = torch.floor(u - kernel_width / 2)
+        lrf = self.head_LR(LR)
+        hrf = self.head_HR(GT)
 
-    # What is the maximum number of pixels that can be involved in the
-    # computation?  Note: it's OK to use an extra pixel here; if the
-    # corresponding weights are all zero, it will be eliminated at the end
-    # of this function.
-    P = math.ceil(kernel_width) + 2
+        f = [lrf, hrf]
+        f, _ = self.body(f)
+        f = self.out(f)
+        f = self.globalPooling(f)
+        f = f.view(f.size()[:2])
 
-    # The indices of the input pixels involved in computing the k-th output
-    # pixel are in row k of the indices matrix.
-    indices = left.view(out_length, 1).expand(out_length, P) + torch.linspace(
-        0, P - 1, P).view(1, P).expand(out_length, P)
-
-    # The weights used to compute the k-th output pixel are in row k of the
-    # weights matrix.
-    distance_to_center = u.view(out_length, 1).expand(out_length, P) - indices
-    # apply cubic kernel
-    if (scale < 1) and (antialiasing):
-        weights = scale * cubic(distance_to_center * scale)
-    else:
-        weights = cubic(distance_to_center)
-    # Normalize the weights matrix so that each row sums to 1.
-    weights_sum = torch.sum(weights, 1).view(out_length, 1)
-    weights = weights / weights_sum.expand(out_length, P)
-
-    # If a column in weights is all zero, get rid of it.
-    weights_zero_tmp = torch.sum((weights == 0), 0)
-    if not math.isclose(weights_zero_tmp[0], 0, rel_tol=1e-6):
-        indices = indices.narrow(1, 1, P - 2)
-        weights = weights.narrow(1, 1, P - 2)
-    if not math.isclose(weights_zero_tmp[-1], 0, rel_tol=1e-6):
-        indices = indices.narrow(1, 0, P - 2)
-        weights = weights.narrow(1, 0, P - 2)
-    weights = weights.contiguous()
-    indices = indices.contiguous()
-    sym_len_s = -indices.min() + 1
-    sym_len_e = indices.max() - in_length
-    indices = indices + sym_len_s - 1
-    return weights, indices, int(sym_len_s), int(sym_len_e)
+        return f
 
 
-def imresize(img, scale, antialiasing=True):
-    # Now the scale should be the same for H and W
-    # input: img: CHW RGB [0,1]
-    # output: CHW RGB [0,1] w/o round
-    is_numpy = False
-    if isinstance(img, np.ndarray):
-        img = torch.from_numpy(img.transpose(2, 0, 1))
-        is_numpy = True
-    device = img.device
+class Restorer(nn.Module):
+    def __init__(
+        self, in_nc=3, out_nc=3, nf=64, nb=8, scale=4, input_para=10, min=0.0, max=1.0
+    ):
+        super(Restorer, self).__init__()
+        self.min = min
+        self.max = max
+        self.para = input_para
+        self.num_blocks = nb
 
-    is_batch = True
-    if len(img.shape) == 3:  # C, H, W
-        img = img[None]
-        is_batch = False
+        self.head = nn.Conv2d(in_nc, nf, 3, stride=1, padding=1)
 
-    B, in_C, in_H, in_W = img.size()
-    img = img.view(-1, in_H, in_W)
-    _, out_H, out_W = in_C, math.ceil(in_H * scale), math.ceil(in_W * scale)
-    kernel_width = 4
-    kernel = 'cubic'
+        body = [CRB_Layer(nf, input_para) for _ in range(nb)]
+        self.body = nn.Sequential(*body)
 
-    # Return the desired dimension order for performing the resize.  The
-    # strategy is to perform the resize first along the dimension with the
-    # smallest scale factor.
-    # Now we do not support this.
+        self.fusion = nn.Conv2d(nf, nf, 3, 1, 1)
 
-    # get weights and indices
-    weights_H, indices_H, sym_len_Hs, sym_len_He = calculate_weights_indices(
-        in_H, out_H, scale, kernel, kernel_width, antialiasing)
-    weights_H, indices_H = weights_H.to(device), indices_H.to(device)
-    weights_W, indices_W, sym_len_Ws, sym_len_We = calculate_weights_indices(
-        in_W, out_W, scale, kernel, kernel_width, antialiasing)
-    weights_W, indices_W = weights_W.to(device), indices_W.to(device)
-    # process H dimension
-    # symmetric copying
-    img_aug = torch.FloatTensor(B * in_C, in_H + sym_len_Hs + sym_len_He,
-                                in_W).to(device)
-    img_aug.narrow(1, sym_len_Hs, in_H).copy_(img)
+        if scale == 4:  # x4
+            self.upscale = nn.Sequential(
+                nn.Conv2d(
+                    in_channels=nf,
+                    out_channels=nf * scale,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=True,
+                ),
+                nn.PixelShuffle(scale // 2),
+                nn.Conv2d(
+                    in_channels=nf,
+                    out_channels=nf * scale,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=True,
+                ),
+                nn.PixelShuffle(scale // 2),
+                nn.Conv2d(nf, 3, 3, 1, 1),
+            )
+        else:  # x2, x3
+            self.upscale = nn.Sequential(
+                nn.Conv2d(
+                    in_channels=nf,
+                    out_channels=nf * scale ** 2,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=True,
+                ),
+                nn.PixelShuffle(scale),
+                nn.Conv2d(nf, 3, 3, 1, 1),
+            )
 
-    sym_patch = img[:, :sym_len_Hs, :]
-    inv_idx = torch.arange(sym_patch.size(1) - 1, -1, -1).long().to(device)
-    sym_patch_inv = sym_patch.index_select(1, inv_idx)
-    img_aug.narrow(1, 0, sym_len_Hs).copy_(sym_patch_inv)
+    def forward(self, input, ker_code):
+        B, C, H, W = input.size()  # I_LR batch
+        B_h, C_h = ker_code.size()  # Batch, Len=10
+        ker_code_exp = ker_code.view((B_h, C_h, 1, 1)).expand(
+            (B_h, C_h, H, W)
+        )  # kernel_map stretch
 
-    sym_patch = img[:, -sym_len_He:, :]
-    inv_idx = torch.arange(sym_patch.size(1) - 1, -1, -1).long().to(device)
-    sym_patch_inv = sym_patch.index_select(1, inv_idx)
-    img_aug.narrow(1, sym_len_Hs + in_H, sym_len_He).copy_(sym_patch_inv)
+        f = self.head(input)
+        inputs = [f, ker_code_exp]
+        f, _ = self.body(inputs)
+        f = self.fusion(f)
+        out = self.upscale(f)
 
-    out_1 = torch.FloatTensor(B * in_C, out_H, in_W).to(device)
-    kernel_width = weights_H.size(1)
-    for i in range(out_H):
-        idx = int(indices_H[i][0])
-        out_1[:, i, :] = (img_aug[:, idx:idx + kernel_width, :].transpose(
-            1, 2).matmul(weights_H[i][None, :, None].repeat(B * in_C, 1,
-                                                            1))).squeeze()
-
-    # process W dimension
-    # symmetric copying
-    out_1_aug = torch.FloatTensor(B * in_C, out_H,
-                                  in_W + sym_len_Ws + sym_len_We).to(device)
-    out_1_aug.narrow(2, sym_len_Ws, in_W).copy_(out_1)
-
-    sym_patch = out_1[:, :, :sym_len_Ws]
-    inv_idx = torch.arange(sym_patch.size(2) - 1, -1, -1).long().to(device)
-    sym_patch_inv = sym_patch.index_select(2, inv_idx)
-    out_1_aug.narrow(2, 0, sym_len_Ws).copy_(sym_patch_inv)
-
-    sym_patch = out_1[:, :, -sym_len_We:]
-    inv_idx = torch.arange(sym_patch.size(2) - 1, -1, -1).long().to(device)
-    sym_patch_inv = sym_patch.index_select(2, inv_idx)
-    out_1_aug.narrow(2, sym_len_Ws + in_W, sym_len_We).copy_(sym_patch_inv)
-
-    out_2 = torch.FloatTensor(B * in_C, out_H, out_W).to(device)
-    kernel_width = weights_W.size(1)
-    for i in range(out_W):
-        idx = int(indices_W[i][0])
-        out_2[:, :, i] = (out_1_aug[:, :, idx:idx + kernel_width].matmul(
-            weights_W[i][None, :, None].repeat(B * in_C, 1, 1))).squeeze()
-
-    out_2 = out_2.contiguous().view(B, in_C, out_H, out_W)
-    if not is_batch:
-        out_2 = out_2[0]
-    return out_2.cpu().numpy().transpose(1, 2, 0) if is_numpy else out_2
+        return out  # torch.clamp(out, min=self.min, max=self.max)
 
 
-def DUF_downsample(x, scale=4):
-    """Downsamping with Gaussian kernel used in the DUF official code
-    Args:
-        x (Tensor, [B, T, C, H, W]): frames to be downsampled.
-        scale (int): downsampling factor: 2 | 3 | 4.
-    """
-
-    assert scale in [2, 3, 4], 'Scale [{}] is not supported'.format(scale)
-
-    def gkern(kernlen=13, nsig=1.6):
-        import scipy.ndimage.filters as fi
-
-        inp = np.zeros((kernlen, kernlen))
-        # set element at the middle to one, a dirac delta
-        inp[kernlen // 2, kernlen // 2] = 1
-        # gaussian-smooth the dirac, resulting in a gaussian filter mask
-        return fi.gaussian_filter(inp, nsig)
-
-    B, T, C, H, W = x.size()
-    x = x.view(-1, 1, H, W)
-    # 6 is the pad of the gaussian filter
-    pad_w, pad_h = 6 + scale * 2, 6 + scale * 2
-    r_h, r_w = 0, 0
-    if scale == 3:
-        r_h = 3 - (H % 3)
-        r_w = 3 - (W % 3)
-    x = F.pad(x, [pad_w, pad_w + r_w, pad_h, pad_h + r_h], 'reflect')
-
-    gaussian_filter = (
-        torch.from_numpy(gkern(13, 0.4 *
-                               scale)).type_as(x).unsqueeze(0).unsqueeze(0))
-    x = F.conv2d(x, gaussian_filter, stride=scale)
-    x = x[:, :, 2:-2, 2:-2]
-    x = x.view(B, T, C, x.size(2), x.size(3))
-    return x
-
-
-def PCA(data, k=2):
-    X = torch.from_numpy(data)
-    X_mean = torch.mean(X, 0)
-    X = X - X_mean.expand_as(X)
-    U, S, V = torch.svd(torch.t(X))
-    return U[:, :k]  # PCA matrix
-
-
-def random_batch_kernel(
-    batch,
-    kernel_size=21,
-    sig_min=0.2,
-    sig_max=4.0,
-    rate_iso=1.0,
-    tensor=True,
-    random_disturb=False,
-):
-    if rate_iso == 1:
-
-        sigma = np.random.uniform(sig_min, sig_max, (batch, 1, 1))
-        ax = np.arange(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
-        xx, yy = np.meshgrid(ax, ax)
-        xx = xx[None].repeat(batch, 0)
-        yy = yy[None].repeat(batch, 0)
-        kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
-        kernel = kernel / np.sum(kernel, (1, 2), keepdims=True)
-        return torch.FloatTensor(kernel) if tensor else kernel
-
-    else:
-
-        sigma_x = np.random.uniform(sig_min, sig_max, (batch, 1, 1))
-        sigma_y = np.random.uniform(sig_min, sig_max, (batch, 1, 1))
-
-        D = np.zeros((batch, 2, 2))
-        D[:, 0, 0] = sigma_x.squeeze()**2
-        D[:, 1, 1] = sigma_y.squeeze()**2
-
-        radians = np.random.uniform(-np.pi, np.pi, (batch))
-        mask_iso = np.random.uniform(0, 1, (batch)) < rate_iso
-        radians[mask_iso] = 0
-        sigma_y[mask_iso] = sigma_x[mask_iso]
-
-        U = np.zeros((batch, 2, 2))
-        U[:, 0, 0] = np.cos(radians)
-        U[:, 0, 1] = -np.sin(radians)
-        U[:, 1, 0] = np.sin(radians)
-        U[:, 1, 1] = np.cos(radians)
-        sigma = np.matmul(U, np.matmul(D, U.transpose(0, 2, 1)))
-        ax = np.arange(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
-        xx, yy = np.meshgrid(ax, ax)
-        xy = np.hstack((xx.reshape((kernel_size * kernel_size, 1)),
-                        yy.reshape(kernel_size * kernel_size,
-                                   1))).reshape(kernel_size, kernel_size, 2)
-        xy = xy[None].repeat(batch, 0)
-        inverse_sigma = np.linalg.inv(sigma)[:, None, None]
-        kernel = np.exp(-0.5 * np.matmul(
-            np.matmul(xy[:, :, :, None], inverse_sigma), xy[:, :, :, :, None]))
-        kernel = kernel.reshape(batch, kernel_size, kernel_size)
-        if random_disturb:
-            kernel = kernel + np.random.uniform(
-                0, 0.25, (batch, kernel_size, kernel_size)) * kernel
-        kernel = kernel / np.sum(kernel, (1, 2), keepdims=True)
-
-        return torch.FloatTensor(kernel) if tensor else kernel
-
-
-def stable_batch_kernel(batch, kernel_size=21, sig=2.6, tensor=True):
-    sigma = sig
-    ax = np.arange(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
-    xx, yy = np.meshgrid(ax, ax)
-    xx = xx[None].repeat(batch, 0)
-    yy = yy[None].repeat(batch, 0)
-    kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
-    kernel = kernel / np.sum(kernel, (1, 2), keepdims=True)
-    return torch.FloatTensor(kernel) if tensor else kernel
-
-
-def b_Bicubic(variable, scale):
-    B, C, H, W = variable.size()
-    # H_new = int(H / scale)
-    # W_new = int(W / scale)
-    tensor_v = variable.view((B, C, H, W))
-    re_tensor = imresize(tensor_v, 1 / scale)
-    return re_tensor
-
-
-def random_batch_noise(batch, high, rate_cln=1.0):
-    noise_level = np.random.uniform(size=(batch, 1)) * high
-    noise_mask = np.random.uniform(size=(batch, 1))
-    noise_mask[noise_mask < rate_cln] = 0
-    noise_mask[noise_mask >= rate_cln] = 1
-    return noise_level * noise_mask
-
-
-def b_GaussianNoising(tensor,
-                      sigma,
-                      mean=0.0,
-                      noise_size=None,
-                      min=0.0,
-                      max=1.0):
-    if noise_size is None:
-        size = tensor.size()
-    else:
-        size = noise_size
-    noise = torch.mul(
-        torch.FloatTensor(np.random.normal(loc=mean, scale=1.0, size=size)),
-        sigma.view(sigma.size() + (1, 1)),
-    ).to(tensor.device)
-    return torch.clamp(noise + tensor, min=min, max=max)
-
-
-class BatchSRKernel(object):
-
+@BACKBONES.register_module()
+class DAN(nn.Module):
     def __init__(
         self,
+        nf=64,
+        nb=16,
+        upscale=4,
+        input_para=10,
         kernel_size=21,
-        sig=2.6,
-        sig_min=0.2,
-        sig_max=4.0,
-        rate_iso=1.0,
-        random_disturb=False,
+        loop=8,
+        pca_matrix_path=None,
     ):
-        self.kernel_size = kernel_size
-        self.sig = sig
-        self.sig_min = sig_min
-        self.sig_max = sig_max
-        self.rate = rate_iso
-        self.random_disturb = random_disturb
+        super(DAN, self).__init__()
 
-    def __call__(self, random, batch, tensor=False):
-        if random:  # random kernel
-            return random_batch_kernel(
-                batch,
-                kernel_size=self.kernel_size,
-                sig_min=self.sig_min,
-                sig_max=self.sig_max,
-                rate_iso=self.rate,
-                tensor=tensor,
-                random_disturb=self.random_disturb,
-            )
-        else:  # stable kernel
-            return stable_batch_kernel(
-                batch,
-                kernel_size=self.kernel_size,
-                sig=self.sig,
-                tensor=tensor)
+        self.ksize = kernel_size
+        self.loop = loop
+        self.scale = upscale
 
+        self.Restorer = Restorer(nf=nf, nb=nb, scale=self.scale, input_para=input_para)
+        self.Estimator = Estimator(kernel_size=kernel_size, scale=self.scale)
 
-class BatchBlurKernel(object):
+        self.register_buffer("encoder", torch.load(pca_matrix_path)[None])
 
-    def __init__(self, kernels_path):
-        kernels = loadmat(kernels_path)['kernels']
-        self.num_kernels = kernels.shape[0]
-        self.kernels = kernels
+        kernel = torch.zeros(1, self.ksize, self.ksize)
+        kernel[:, self.ksize // 2, self.ksize // 2] = 1
 
-    def __call__(self, random, batch, tensor=False):
-        index = np.random.randint(0, self.num_kernels, batch)
-        kernels = self.kernels[index]
-        return torch.FloatTensor(kernels).contiguous() if tensor else kernels
+        self.register_buffer("init_kernel", kernel)
+        init_ker_map = self.init_kernel.view(1, 1, self.ksize ** 2).matmul(
+            self.encoder
+        )[:, 0]
+        self.register_buffer("init_ker_map", init_ker_map)
 
+    def forward(self, lr):
 
-class PCAEncoder(nn.Module):
+        srs = []
+        ker_maps = []
 
-    def __init__(self, weight):
-        super().__init__()
-        self.register_buffer('weight', weight)
-        self.size = self.weight.size()
+        B, C, H, W = lr.shape
+        ker_map = self.init_ker_map.repeat([B, 1])
 
-    def forward(self, batch_kernel):
-        B, H, W = batch_kernel.size()  # [B, l, l]
-        return torch.bmm(
-            batch_kernel.view((B, 1, H * W)),
-            self.weight.expand((B, ) + self.size)).view((B, -1))
+        for i in range(self.loop):
 
+            sr = self.Restorer(lr, ker_map.detach())
+            ker_map = self.Estimator(sr.detach(), lr)
 
-class BatchBlur(object):
+            srs.append(sr)
+            ker_maps.append(ker_map)
+        return [srs, ker_maps]
 
-    def __init__(self, kernel_size=15):
-        self.kernel_size = kernel_size
-        if kernel_size % 2 == 1:
-            self.pad = (kernel_size // 2, kernel_size // 2, kernel_size // 2,
-                        kernel_size // 2)
+    def init_weights(self, pretrained=None, strict=True):
+        """Init weights for models.
+        Args:
+            pretrained (str, optional): Path for pretrained weights. If given
+                None, pretrained weights will not be loaded. Defaults to None.
+            strict (boo, optional): Whether strictly load the pretrained model.
+                Defaults to True.
+        """
+        if isinstance(pretrained, str):
+            logger = get_root_logger()
+            load_checkpoint(self, pretrained, strict=strict, logger=logger)
+        elif pretrained is None:
+            pass  # use default initialization
         else:
-            self.pad = (kernel_size // 2, kernel_size // 2 - 1,
-                        kernel_size // 2, kernel_size // 2 - 1)
-        # self.pad = nn.ZeroPad2d(l // 2)
-
-    def __call__(self, input, kernel):
-        B, C, H, W = input.size()
-        pad = F.pad(input, self.pad, mode='reflect')
-        H_p, W_p = pad.size()[-2:]
-
-        if len(kernel.size()) == 2:
-            input_CBHW = pad.view((C * B, 1, H_p, W_p))
-            kernel_var = kernel.contiguous().view(
-                (1, 1, self.kernel_size, self.kernel_size))
-            return F.conv2d(
-                input_CBHW, kernel_var, padding=0).view((B, C, H, W))
-        else:
-            input_CBHW = pad.view((1, C * B, H_p, W_p))
-            kernel_var = (
-                kernel.contiguous().view(
-                    (B, 1, self.kernel_size,
-                     self.kernel_size)).repeat(1, C, 1, 1).view(
-                         (B * C, 1, self.kernel_size, self.kernel_size)))
-            return F.conv2d(
-                input_CBHW, kernel_var, groups=B * C).view((B, C, H, W))
-
-
-class SRMDPreprocessing(object):
-
-    def __init__(self,
-                 scale,
-                 pca_matrix,
-                 ksize=21,
-                 code_length=10,
-                 random_kernel=True,
-                 noise=False,
-                 cuda=False,
-                 random_disturb=False,
-                 sig=0,
-                 sig_min=0,
-                 sig_max=0,
-                 rate_iso=1.0,
-                 rate_cln=1,
-                 noise_high=0,
-                 stored_kernel=False,
-                 pre_kernel_path=None):
-        self.encoder = PCAEncoder(pca_matrix).cuda() if cuda else PCAEncoder(
-            pca_matrix)
-
-        self.kernel_gen = (
-            BatchSRKernel(
-                kernel_size=ksize,
-                sig=sig,
-                sig_min=sig_min,
-                sig_max=sig_max,
-                rate_iso=rate_iso,
-                random_disturb=random_disturb,
-            ) if not stored_kernel else BatchBlurKernel(pre_kernel_path))
-
-        self.blur = BatchBlur(kernel_size=ksize)
-        self.para_in = code_length
-        self.kernel_size = ksize
-        self.noise = noise
-        self.scale = scale
-        self.cuda = cuda
-        self.rate_cln = rate_cln
-        self.noise_high = noise_high
-        self.random = random_kernel
-
-    def __call__(self, hr_tensor, kernel=False):
-        # hr_tensor is tensor, not cuda tensor
-
-        hr_var = Variable(hr_tensor).cuda() if self.cuda else Variable(
-            hr_tensor)
-        device = hr_var.device
-        B, C, H, W = hr_var.size()
-
-        b_kernels = Variable(self.kernel_gen(self.random, B,
-                                             tensor=True)).to(device)
-        hr_blured_var = self.blur(hr_var, b_kernels)
-
-        # B x self.para_input
-        kernel_code = self.encoder(b_kernels)
-
-        # Down sample
-        if self.scale != 1:
-            lr_blured_t = b_Bicubic(hr_blured_var, self.scale)
-        else:
-            lr_blured_t = hr_blured_var
-
-        # Noisy
-        if self.noise:
-            Noise_level = torch.FloatTensor(
-                random_batch_noise(B, self.noise_high, self.rate_cln))
-            lr_noised_t = b_GaussianNoising(lr_blured_t, self.noise_high)
-        else:
-            Noise_level = torch.zeros((B, 1))
-            lr_noised_t = lr_blured_t
-
-        Noise_level = Variable(Noise_level).cuda()
-        re_code = (
-            torch.cat([kernel_code, Noise_level *
-                       10], dim=1) if self.noise else kernel_code)
-        lr_re = Variable(lr_noised_t).to(device)
-
-        return (lr_re, re_code, b_kernels) if kernel else (lr_re, re_code)
+            raise TypeError('"pretrained" must be a str or None. '
+                            f'But received {type(pretrained)}.')
