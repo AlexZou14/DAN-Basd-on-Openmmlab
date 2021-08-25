@@ -80,8 +80,11 @@ python tools/test.py configs/restorers/dan/dan_setting2.py ${CHECKPOINT_FILE} [-
 ### DIV2KRK
 The passwds of download links are all 'ta2o'
 
-| Method | scale | Datasets | PSNR | Download |
-| :-----: | :----: | :----: | :----: | :----:| 
-| DAN | x4 | DIV2KRK | 27.41 | [model](https://pan.baidu.com/s/1T_BOVR7Ui-NLUIKr6R20-w) / [test_pkl](https://pan.baidu.com/s/1T_BOVR7Ui-NLUIKr6R20-w) |
+| Method | scale | Datasets | PSNR | SSIM | Download |
+| :-----: | :----: | :----: | :----: | :----: | :----:| 
+| DAN-RGB (paper) | x4 | DIV2KRK | 26.09 | 0.7312 | - |
+| DAN-Y (paper) | x4 | DIV2KRK | 27.55 | 0.7582 | - |
+| DAN-RGB (Ours) | x4 | DIV2KRK | 27.41 | 0.7666 | [model](https://pan.baidu.com/s/1T_BOVR7Ui-NLUIKr6R20-w) / [test_pkl](https://pan.baidu.com/s/1T_BOVR7Ui-NLUIKr6R20-w) |
+| DAN-RGB (Ours) | x4 | DIV2KRK | 28.88 | 0.7915 | [model](https://pan.baidu.com/s/1T_BOVR7Ui-NLUIKr6R20-w) / [test_pkl](https://pan.baidu.com/s/1T_BOVR7Ui-NLUIKr6R20-w) |
 
 ------------
